@@ -424,7 +424,18 @@ Normalise to E.164, default country `+91` (strip spaces, dashes, leading `0`, ha
 }
 ```
 
-> **Assumption to verify:** the existing Sheet rows contain phone/email/message in addition to the first/last name columns. Adapt this schema to the real columns when wiring the Apps Script.
+> **Real website-leads Sheet columns (confirmed):**
+> `Date | Name | WhatsApp | Occasion | Result | Submission Timestamp | Country | City | Device Type | OS / Device | Browser | State / Region | Traffic Source`
+>
+> Field mapping for the ingest payload:
+> - `first_name` ← `Name` (full name; no separate last_name column — pass empty string for `last_name`)
+> - `phone` ← `WhatsApp`
+> - `message` ← `Occasion`
+> - `source` ← `"website"` (hardcoded)
+> - `submitted_at` ← `Submission Timestamp`
+> - `sheet_row` ← row number
+> - Store `Country`, `City`, `Device Type`, `OS / Device`, `Browser`, `State / Region`, `Traffic Source` as extra metadata in the `raw_ingest.payload` JSON for analytics use later.
+> - `Result` is the owner's manual status column in the Sheet; ignore during ingestion (the app's `lead_status` replaces it).
 
 ### 7.2 Processing steps (in order)
 1. **Insert the raw payload into `raw_ingest` first** (service role). Even if later steps fail, the lead is recoverable.
@@ -538,12 +549,42 @@ Sidebar (desktop) / bottom bar (mobile): Dashboard, Leads, Follow-ups, Calendar,
 
 `scripts/import-sheet.ts` — run locally, idempotent, with `--dry-run`.
 
-1. Input: CSV export(s) of the **Leads** and **Bookings** sheets (simplest; Sheets API optional later).
-2. A column-mapping config at the top of the script (header name → field) so it adapts to the real sheet columns.
-3. For each lead row: `parseLead(first, last, now)` → normalise phone → upsert contact by phone → insert lead with `external_id = 'sheet:<sheetId>:<row>'` (re-running skips existing).
-4. For bookings rows: match to contact by phone/name, insert booking + payments if present.
-5. Print a report: rows read, created, duplicates skipped, `needs_review` count (list the raw values), and any bookings that conflict on dates.
-6. **Do not** create auto follow-ups for imported historical leads unless `--with-followups` is passed.
+1. Input: CSV export(s) of the three sheets below. Sheets API optional later.
+2. A column-mapping config at the top of the script (header name → field) — see §16 for real headers.
+3. **Leads/contacts sheet** (the owner's manual leads tracker):
+   - `Contact Name` → `contacts.name`
+   - `Phone Number` → `contacts.phone` (normalise E.164)
+   - `Notes` → `contacts.notes`
+   - `Creation Date` → `leads.created_at` (import as historical timestamp)
+   - `Status` → **free-form string; do not map**. All imported leads are created as `new`. Optionally append the sheet's status text to `contacts.notes` for reference.
+   - `WhatsApp Chat` → store as note or ignore (URL not structured)
+   - `Task ID` → `leads.external_id` prefix `"sheet-leads:"`
+   - `Sortable date` → used only for ordering; ignore after import
+4. **Website leads sheet** (auto-populated by Apps Script):
+   - `Name` → parse as `first_name` (no last_name column; pass `""` for last)
+   - `Occasion` → `last_name` field fed into `parseLead()` for event type / date / guests
+   - `WhatsApp` → `contacts.phone`
+   - `Submission Timestamp` → `leads.created_at`
+   - `Result` → **free-form string; do not map**. All imported leads are created as `new`. Optionally append the value to `contacts.notes` for reference.
+   - Metadata fields (`Country`, `City`, `Device Type`, `OS / Device`, `Browser`, `State / Region`, `Traffic Source`) → stored in `raw_ingest.payload`
+5. **Event bookings sheet**:
+   - `Booked date` → `bookings.created_at` (historical)
+   - `Name` → match to existing contact by name/phone; create if missing
+   - `Column 2` → likely phone; inspect data and map to `contacts.phone`
+   - `Event status` → `bookings.status` (see §16 mapping)
+   - `Occassion` → `bookings.event_type`
+   - `referral source` → `leads.source`
+   - `Pax` → `bookings.guests_expected`
+   - `Rate` → `bookings.total_amount`
+   - `Deposit`, `Advance paid`, `Final Payment` → three rows in `payments` (with `method='bank_transfer'` as default; inspect actual data)
+   - `pending` → derived field; cross-check against `balance` view after import; flag discrepancies
+   - `Total` → cross-check equals `Deposit + Advance paid + Final Payment`; flag if not
+   - `Deposit Returned?` → note field on the booking or a boolean flag (add `deposit_returned boolean` column to `bookings` if needed — see §16)
+   - `Net Revenue` → derived (`Total − Deposit Returned`); do not store, recompute
+   - `slno.` → ordering only, ignore
+   - `Column 17` → inspect; if empty, ignore
+6. Print a report: rows read, created, duplicates skipped, `needs_review` count (list the raw values), payment discrepancies, and any bookings that conflict on dates.
+7. **Do not** create auto follow-ups for imported historical leads unless `--with-followups` is passed.
 
 Cutover plan: run the importer → enable webhook alongside the Apps Script → compare counts for ~2 weeks → make the app the source of truth → keep the Sheet as a read-only archive.
 
@@ -642,11 +683,98 @@ Provide `.env.example` and fail fast at startup if required vars are missing (zo
 ## 15. Assumptions & Open Items (confirm or adjust)
 
 1. **One main event per day; small events/photoshoots may share the day** (warned, not blocked). If you ever want two *main* events on one day (morning + evening), extend the exclusion constraint to include `slot`, treating `full_day` and multi-day as overlapping both.
-2. **Lead payload fields** (phone, email, message) exist in the Sheet/form; map to the real column names.
+2. **Lead payload fields** are now confirmed — see §16 for the real column mapping from all three sheets.
 3. **Subdomain** `app.terrabithia.in` is a placeholder — change freely.
 4. **Farm stays** are modelled as multi-day bookings (`start_date`..`end_date`); room-level inventory is a later module.
 5. **Statuses, lost reasons, event types, follow-up intervals** are sensible defaults and are editable in settings.
 6. Imported historical leads do not generate follow-ups unless requested.
+7. **`Deposit Returned?`** column in the bookings sheet: decide before import whether to add a `deposit_returned boolean` column to the `bookings` table or model it as a negative payment. Leaning towards a boolean flag + a `deposit_returned_amount numeric(12,2)` so Net Revenue is always computable.
+
+---
+
+## 16. Real Google Sheets Column Mapping
+
+This section records the **actual column headers** from the three source sheets. Use these in `scripts/import-sheet.ts` and when building the ingest payload in the Apps Script hook.
+
+### 16.1 Leads / Contacts tracker (owner's manual Sheet)
+
+| Sheet column | Maps to | Notes |
+|---|---|---|
+| Contact Name | `contacts.name` | |
+| Phone Number | `contacts.phone` | Normalise → E.164 (`+91` default) |
+| Notes | `contacts.notes` | |
+| Creation Date | `leads.created_at` | Parse as `Asia/Kolkata` timestamp |
+| Status | *(free-form string, ignore)* | All imports default to `leads.status = 'new'`; optionally append raw text to `contacts.notes` |
+| WhatsApp Chat | *(note / ignore)* | May be a wa.me URL; not structured |
+| Task ID | `leads.external_id` | Prefix with `"sheet-leads:"` for idempotency |
+| Sortable date | *(sort key only)* | Ignore after import |
+
+### 16.2 Website leads Sheet (auto-populated by Apps Script)
+
+| Sheet column | Maps to | Notes |
+|---|---|---|
+| Date | *(informational)* | Use `Submission Timestamp` instead for precision |
+| Name | `first_name` in ingest payload | Full name; no separate last_name column — pass `""` for `last_name` |
+| WhatsApp | `contacts.phone` | Normalise → E.164 |
+| Occasion | `last_name` in `parseLead()` | Contains event type / date / guest count — feed directly into the parser |
+| Result | *(free-form string, ignore)* | All imports default to `leads.status = 'new'`; optionally append raw text to `contacts.notes` |
+| Submission Timestamp | `leads.created_at` / `submitted_at` | Primary timestamp |
+| Country | `raw_ingest.payload.country` | Metadata only |
+| City | `raw_ingest.payload.city` | Metadata only |
+| Device Type | `raw_ingest.payload.device_type` | Metadata only |
+| OS / Device | `raw_ingest.payload.os_device` | Metadata only |
+| Browser | `raw_ingest.payload.browser` | Metadata only |
+| State / Region | `raw_ingest.payload.state_region` | Metadata only |
+| Traffic Source | `raw_ingest.payload.traffic_source` | Metadata only |
+
+### 16.3 Event bookings Sheet
+
+| Sheet column | Maps to | Notes |
+|---|---|---|
+| slno. | *(ordering)* | Ignore |
+| Booked date | `bookings.created_at` | Historical timestamp |
+| Name | `contacts.name` | Match to existing contact; create if new |
+| Column 2 | `contacts.phone` | **Inspect data** — likely phone number |
+| Event status | `bookings.status` | Map labels → `booking_status` enum (**confirm labels**) |
+| Occassion | `bookings.event_type` | Note: typo in Sheet header is intentional |
+| referral source | `leads.source` | Map to `lead_source` enum |
+| Pax | `bookings.guests_expected` | Integer |
+| Rate | `bookings.total_amount` | `numeric(12,2)`, INR |
+| Deposit | `payments` row 1 | `note = 'Deposit'` |
+| Advance paid | `payments` row 2 | `note = 'Advance'` |
+| Final Payment | `payments` row 3 | `note = 'Final'` |
+| pending | *(derived)* | Cross-check vs `balance` view; flag discrepancies |
+| Total | *(derived / cross-check)* | Should equal sum of Deposit + Advance + Final |
+| Deposit Returned? | `bookings.deposit_returned` | Add `deposit_returned boolean default false` + `deposit_returned_amount numeric(12,2)` to `bookings` table (open item §15.7) |
+| Net Revenue | *(derived)* | `Total − deposit_returned_amount`; do not store |
+| Column 17 | *(inspect)* | Map if non-empty; ignore otherwise |
+
+### 16.4 Apps Script payload (updated)
+
+The `pushToOps_` function in §7.3 must map the **Website leads Sheet** columns:
+
+```javascript
+payload: JSON.stringify({
+  external_id: 'sheet:' + SpreadsheetApp.getActive().getId() + ':' + row.rowNumber,
+  first_name: row['Name'],          // full name; no last_name column
+  last_name: '',                     // empty — Occasion goes into message
+  phone: row['WhatsApp'],
+  message: row['Occasion'],          // parseLead() will extract event/date/pax from this
+  source: 'website',
+  submitted_at: row['Submission Timestamp'] || new Date().toISOString(),
+  sheet_row: row.rowNumber,
+  // metadata stored as-is in raw_ingest.payload:
+  country: row['Country'],
+  city: row['City'],
+  device_type: row['Device Type'],
+  os_device: row['OS / Device'],
+  browser: row['Browser'],
+  state_region: row['State / Region'],
+  traffic_source: row['Traffic Source']
+}),
+```
+
+Update the ingest zod schema (§7.1) to accept these optional metadata fields and pass them through to `raw_ingest.payload`.
 
 ## 16. Future Modules (design the nav/registry so these slot in)
 Quotes & tariff PDF generator · expenses & vendor tracking · staff/task assignment for events · post-event feedback & review requests · inventory (decor, tents, furniture) · reports (conversion by source, monthly revenue, occupancy) · WhatsApp Business API integration · Google Calendar sync · farm-stay room management.
